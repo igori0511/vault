@@ -113,7 +113,7 @@ func TestPolicy_Kyber_SupportedFeatures(t *testing.T) {
 			if c.kt.DerivationSupported() {
 				t.Fatalf("derivation should not be supported")
 			}
-			if c.kt.AssociatedDataSupported() {
+			if !c.kt.AssociatedDataSupported() {
 				t.Fatalf("associated data should not be supported")
 			}
 			if c.kt.PaddingSchemesSupported() {
@@ -334,6 +334,365 @@ func TestPolicy_Kyber_DecryptWithFactory_WrongNumberOfFields(t *testing.T) {
 			badCT := strings.Replace(ct, v1, "vault:v1", 1)
 			if _, err := p.DecryptWithFactory(nil, nil, badCT); err == nil {
 				t.Fatal("expected error for wrong number of fields")
+			}
+		})
+	}
+}
+
+// TestAssociatedDataFactory is a mock factory for testing associated data functionality
+type TestAssociatedDataFactory struct {
+	data []byte
+	err  error
+}
+
+func (f *TestAssociatedDataFactory) GetAssociatedData() ([]byte, error) {
+	return f.data, f.err
+}
+
+func TestPolicy_Kyber_AssociatedData_RoundTrip(t *testing.T) {
+	cases := []struct {
+		name string
+		kt   KeyType
+	}{
+		{"kyber512", KeyType_Kyber512},
+		{"kyber768", KeyType_Kyber768},
+		{"kyber1024", KeyType_Kyber1024},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			p := &Policy{Name: c.name + "-ad-roundtrip", Type: c.kt}
+			if err := p.RotateInMemory(rand.Reader); err != nil {
+				t.Fatalf("RotateInMemory: %v", err)
+			}
+
+			if p.LatestVersion != 1 {
+				t.Fatalf("LatestVersion=%d", p.LatestVersion)
+			}
+
+			plain := []byte("kyber associated data test")
+			plainB64 := base64.StdEncoding.EncodeToString(plain)
+			associatedData := []byte("test-associated-data-kyber")
+
+			adFactory := &TestAssociatedDataFactory{data: associatedData}
+
+			// Encrypt with associated data
+			ct, err := p.EncryptWithFactory(0, nil, nil, plainB64, adFactory)
+			if err != nil {
+				t.Fatalf("EncryptWithFactory: %v", err)
+			}
+
+			prefix := p.getVersionPrefix(1)
+			if !strings.HasPrefix(ct, prefix) {
+				t.Fatalf("missing v1 prefix: %q", ct)
+			}
+
+			// Decrypt with same associated data
+			ptB64, err := p.DecryptWithFactory(nil, nil, ct, adFactory)
+			if err != nil {
+				t.Fatalf("DecryptWithFactory: %v", err)
+			}
+
+			pt, err := base64.StdEncoding.DecodeString(ptB64)
+			if err != nil {
+				t.Fatalf("b64 decode: %v", err)
+			}
+
+			if string(pt) != string(plain) {
+				t.Fatalf("round-trip mismatch: %q vs %q", string(pt), string(plain))
+			}
+		})
+	}
+}
+
+func TestPolicy_Kyber_AssociatedData_WrongAD_Decrypt(t *testing.T) {
+	cases := []struct {
+		name string
+		kt   KeyType
+	}{
+		{"kyber512", KeyType_Kyber512},
+		{"kyber768", KeyType_Kyber768},
+		{"kyber1024", KeyType_Kyber1024},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			p := &Policy{Name: c.name + "-ad-wrong", Type: c.kt}
+			if err := p.RotateInMemory(rand.Reader); err != nil {
+				t.Fatalf("RotateInMemory: %v", err)
+			}
+
+			if p.LatestVersion != 1 {
+				t.Fatalf("LatestVersion=%d", p.LatestVersion)
+			}
+
+			plain := []byte("wrong associated data test")
+			plainB64 := base64.StdEncoding.EncodeToString(plain)
+
+			// Encrypt with one associated data
+			encryptAD := []byte("encrypt-associated-data")
+			encryptFactory := &TestAssociatedDataFactory{data: encryptAD}
+
+			ct, err := p.EncryptWithFactory(0, nil, nil, plainB64, encryptFactory)
+			if err != nil {
+				t.Fatalf("EncryptWithFactory: %v", err)
+			}
+
+			// Try to decrypt with different associated data - should fail
+			decryptAD := []byte("decrypt-associated-data-different")
+			decryptFactory := &TestAssociatedDataFactory{data: decryptAD}
+
+			_, err = p.DecryptWithFactory(nil, nil, ct, decryptFactory)
+			if err == nil {
+				t.Fatal("expected error when decrypting with wrong associated data")
+			}
+			// message can be "decryption failed: invalid ciphertext"
+			if !strings.Contains(strings.ToLower(err.Error()), "decryption failed") {
+				t.Fatalf("unexpected error message: %v", err)
+			}
+		})
+	}
+}
+
+func TestPolicy_Kyber_AssociatedData_Empty(t *testing.T) {
+	cases := []struct {
+		name string
+		kt   KeyType
+	}{
+		{"kyber512", KeyType_Kyber512},
+		{"kyber768", KeyType_Kyber768},
+		{"kyber1024", KeyType_Kyber1024},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			p := &Policy{Name: c.name + "-ad-empty", Type: c.kt}
+			if err := p.RotateInMemory(rand.Reader); err != nil {
+				t.Fatalf("RotateInMemory: %v", err)
+			}
+
+			if p.LatestVersion != 1 {
+				t.Fatalf("LatestVersion=%d", p.LatestVersion)
+			}
+
+			plain := []byte("empty associated data test")
+			plainB64 := base64.StdEncoding.EncodeToString(plain)
+
+			// Use empty associated data
+			emptyADFactory := &TestAssociatedDataFactory{data: []byte{}}
+
+			ct, err := p.EncryptWithFactory(0, nil, nil, plainB64, emptyADFactory)
+			if err != nil {
+				t.Fatalf("EncryptWithFactory: %v", err)
+			}
+
+			// Decrypt with empty AD factory
+			ptB64, err := p.DecryptWithFactory(nil, nil, ct, emptyADFactory)
+			if err != nil {
+				t.Fatalf("DecryptWithFactory: %v", err)
+			}
+
+			pt, err := base64.StdEncoding.DecodeString(ptB64)
+			if err != nil {
+				t.Fatalf("b64 decode: %v", err)
+			}
+
+			if string(pt) != string(plain) {
+				t.Fatalf("round-trip mismatch: %q vs %q", string(pt), string(plain))
+			}
+
+			// Empty AD should be equivalent to nil AD:
+			// 1) Encrypt without any factory (nil AD)
+			ctNoAD, err := p.EncryptWithFactory(0, nil, nil, plainB64)
+			if err != nil {
+				t.Fatalf("EncryptWithFactory (no AD): %v", err)
+			}
+			// Decrypt ciphertext with nil AD using empty AD factory should succeed
+			if _, err = p.DecryptWithFactory(nil, nil, ctNoAD, emptyADFactory); err != nil {
+				t.Fatalf("DecryptWithFactory (nil AD ciphertext, empty AD factory) failed: %v", err)
+			}
+			// Decrypt ciphertext made with empty AD but without a factory (nil AD) should also succeed
+			if _, err = p.DecryptWithFactory(nil, nil, ct); err != nil {
+				t.Fatalf("DecryptWithFactory (empty AD ciphertext, no factory) failed: %v", err)
+			}
+		})
+	}
+}
+
+func TestPolicy_Kyber_AssociatedData_FactoryError(t *testing.T) {
+	cases := []struct {
+		name string
+		kt   KeyType
+	}{
+		{"kyber512", KeyType_Kyber512},
+		{"kyber768", KeyType_Kyber768},
+		{"kyber1024", KeyType_Kyber1024},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			p := &Policy{Name: c.name + "-ad-error", Type: c.kt}
+			if err := p.RotateInMemory(rand.Reader); err != nil {
+				t.Fatalf("RotateInMemory: %v", err)
+			}
+
+			if p.LatestVersion != 1 {
+				t.Fatalf("LatestVersion=%d", p.LatestVersion)
+			}
+
+			plain := []byte("factory error test")
+			plainB64 := base64.StdEncoding.EncodeToString(plain)
+
+			// Factory that errors
+			errorFactory := &TestAssociatedDataFactory{
+				data: []byte("some data"),
+				err:  errors.New("factory error"),
+			}
+
+			// Encryption should fail
+			_, err := p.EncryptWithFactory(0, nil, nil, plainB64, errorFactory)
+			if err == nil {
+				t.Fatal("expected error from factory during encryption")
+			}
+			// match current error text which mentions "associated_data/additional_data"
+			if !strings.Contains(err.Error(), "unable to get associated_data") {
+				t.Fatalf("unexpected error message: %v", err)
+			}
+
+			// Good encrypt; error on decrypt
+			goodFactory := &TestAssociatedDataFactory{data: []byte("good data")}
+			ct, err := p.EncryptWithFactory(0, nil, nil, plainB64, goodFactory)
+			if err != nil {
+				t.Fatalf("EncryptWithFactory: %v", err)
+			}
+
+			// Decryption should fail with error factory
+			_, err = p.DecryptWithFactory(nil, nil, ct, errorFactory)
+			if err == nil {
+				t.Fatal("expected error from factory during decryption")
+			}
+			if !strings.Contains(err.Error(), "unable to get associated_data") {
+				t.Fatalf("unexpected error message: %v", err)
+			}
+		})
+	}
+}
+
+func TestPolicy_Kyber_AssociatedData_LargeData(t *testing.T) {
+	cases := []struct {
+		name string
+		kt   KeyType
+	}{
+		{"kyber512", KeyType_Kyber512},
+		{"kyber768", KeyType_Kyber768},
+		{"kyber1024", KeyType_Kyber1024},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			p := &Policy{Name: c.name + "-ad-large", Type: c.kt}
+			if err := p.RotateInMemory(rand.Reader); err != nil {
+				t.Fatalf("RotateInMemory: %v", err)
+			}
+
+			if p.LatestVersion != 1 {
+				t.Fatalf("LatestVersion=%d", p.LatestVersion)
+			}
+
+			plain := []byte("large associated data test")
+			plainB64 := base64.StdEncoding.EncodeToString(plain)
+
+			// Large associated data (1KB)
+			largeAD := make([]byte, 1024)
+			for i := range largeAD {
+				largeAD[i] = byte(i % 256)
+			}
+
+			largeADFactory := &TestAssociatedDataFactory{data: largeAD}
+
+			ct, err := p.EncryptWithFactory(0, nil, nil, plainB64, largeADFactory)
+			if err != nil {
+				t.Fatalf("EncryptWithFactory: %v", err)
+			}
+
+			ptB64, err := p.DecryptWithFactory(nil, nil, ct, largeADFactory)
+			if err != nil {
+				t.Fatalf("DecryptWithFactory: %v", err)
+			}
+
+			pt, err := base64.StdEncoding.DecodeString(ptB64)
+			if err != nil {
+				t.Fatalf("b64 decode: %v", err)
+			}
+
+			if string(pt) != string(plain) {
+				t.Fatalf("round-trip mismatch: %q vs %q", string(pt), string(plain))
+			}
+		})
+	}
+}
+
+func TestPolicy_Kyber_AssociatedData_MultipleFactories(t *testing.T) {
+	cases := []struct {
+		name string
+		kt   KeyType
+	}{
+		{"kyber512", KeyType_Kyber512},
+		{"kyber768", KeyType_Kyber768},
+		{"kyber1024", KeyType_Kyber1024},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			p := &Policy{Name: c.name + "-ad-multi", Type: c.kt}
+			if err := p.RotateInMemory(rand.Reader); err != nil {
+				t.Fatalf("RotateInMemory: %v", err)
+			}
+
+			if p.LatestVersion != 1 {
+				t.Fatalf("LatestVersion=%d", p.LatestVersion)
+			}
+
+			plain := []byte("multiple factories test")
+			plainB64 := base64.StdEncoding.EncodeToString(plain)
+
+			// With multiple factories, match existing style: last AssociatedDataFactory wins
+			firstADFactory := &TestAssociatedDataFactory{data: []byte("first-ad")}
+			secondADFactory := &TestAssociatedDataFactory{data: []byte("second-ad")}
+
+			// Mix with nil factory to test robustness
+			var nilFactory interface{} = nil
+
+			ct, err := p.EncryptWithFactory(0, nil, nil, plainB64,
+				nilFactory, firstADFactory, secondADFactory)
+			if err != nil {
+				t.Fatalf("EncryptWithFactory: %v", err)
+			}
+
+			// Decrypt with second (last) factory should work
+			ptB64, err := p.DecryptWithFactory(nil, nil, ct, secondADFactory)
+			if err != nil {
+				t.Fatalf("DecryptWithFactory with second factory: %v", err)
+			}
+
+			pt, err := base64.StdEncoding.DecodeString(ptB64)
+			if err != nil {
+				t.Fatalf("b64 decode: %v", err)
+			}
+
+			if string(pt) != string(plain) {
+				t.Fatalf("round-trip mismatch: %q vs %q", string(pt), string(plain))
+			}
+
+			// Decrypt with first factory should fail (last-wins semantics)
+			_, err = p.DecryptWithFactory(nil, nil, ct, firstADFactory)
+			if err == nil {
+				t.Fatal("expected error when decrypting with first factory")
 			}
 		})
 	}

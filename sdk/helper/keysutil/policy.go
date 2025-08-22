@@ -231,10 +231,12 @@ func (kt KeyType) DerivationSupported() bool {
 
 func (kt KeyType) AssociatedDataSupported() bool {
 	switch kt {
-	case KeyType_AES128_GCM96, KeyType_AES256_GCM96, KeyType_ChaCha20_Poly1305, KeyType_MANAGED_KEY:
+	case KeyType_AES256_GCM96, KeyType_ChaCha20_Poly1305,
+		KeyType_Kyber512, KeyType_Kyber768, KeyType_Kyber1024:
 		return true
+	default:
+		return false
 	}
-	return false
 }
 
 func (kt KeyType) CMACSupported() bool {
@@ -1196,6 +1198,7 @@ func (p *Policy) DecryptWithFactory(context, nonce []byte, value string, factori
 		if err != nil {
 			return "", err
 		}
+
 		tpl := p.getVersionPrefix(ver)
 		if !strings.HasPrefix(value, tpl) {
 			return "", errutil.UserError{Err: "invalid ciphertext: version prefix missing"}
@@ -1225,37 +1228,36 @@ func (p *Policy) DecryptWithFactory(context, nonce []byte, value string, factori
 			return "", errutil.InternalError{Err: fmt.Sprintf("failed to unmarshal Kyber private key: %v", err)}
 		}
 
-		// KEM decapsulation -> shared secret
-		ss, err := kyber.s.Decapsulate(sk, capsule)
-		if err != nil {
-			return "", errutil.InternalError{Err: fmt.Sprintf("Kyber decapsulation failed: %v", err)}
+		// Optional associated data (AD) from factory, if provided (last-wins)
+		var ad []byte
+		for index, rawFactory := range factories {
+			if rawFactory == nil {
+				continue
+			}
+			if f, ok := rawFactory.(AssociatedDataFactory); ok {
+				ad, err = f.GetAssociatedData()
+				if err != nil {
+					return "", errutil.InternalError{Err: fmt.Sprintf("unable to get associated_data/additional_data from factory[%d]: %v", index, err)}
+				}
+			}
 		}
 
-		// Derive AES-256 key bound to transcript (capsule + AD)
-		var ad []byte // set if you have external associated data
-		key, err := kyber.deriveAES256Key(ss, capsule, ad)
-		if err != nil {
-			return "", errutil.InternalError{Err: fmt.Sprintf("HKDF derive failed: %v", err)}
-		}
-
-		// Init AEAD
-		aead, err := kyber.newGCM(key)
-		if err != nil {
-			return "", errutil.InternalError{Err: fmt.Sprintf("failed to create AEAD: %v", err)}
-		}
-
-		// Split nonce and ciphertext
-		nonceLen := aead.NonceSize()
+		// Split nonce and ciphertext (AES-GCM uses a 96-bit/12-byte nonce)
+		const nonceLen = 12
 		if len(rest) < nonceLen+1 { // require at least 1 byte of ciphertext
 			return "", errutil.InternalError{Err: "invalid ciphertext: too short"}
 		}
 		nonce := rest[:nonceLen]
 		ct := rest[nonceLen:]
 
-		pt, err := aead.Open(nil, nonce, ct, ad)
+		// Use kyberBox.Decrypt to avoid duplicating crypto flow
+		pt, err := kyber.Decrypt(sk, capsule, nonce, ct, ad)
 		if err != nil {
-			// Opaque failure to avoid oracles
-			return "", errutil.UserError{Err: "decryption failed: invalid ciphertext"}
+			// Map AEAD/AAD mismatch to user error; everything else -> internal
+			if strings.Contains(err.Error(), "decryption failed") {
+				return "", errutil.UserError{Err: "decryption failed: invalid ciphertext"}
+			}
+			return "", errutil.InternalError{Err: fmt.Sprintf("Kyber decryption failed: %v", err)}
 		}
 
 		plain = pt
@@ -2427,8 +2429,21 @@ func (p *Policy) EncryptWithFactory(ver int, context []byte, nonce []byte, value
 		if err != nil {
 			return "", errutil.InternalError{Err: fmt.Sprintf("failed to unmarshal Kyber public key: %v", err)}
 		}
-		// Encrypt: get capsule, nonce, ciphertext
-		capsule, nonce, ct, err := kyber.Encrypt(pk, plaintext, nil)
+		// Optional associated data (AD) from factory, if provided
+		var ad []byte
+		for index, rawFactory := range factories {
+			if rawFactory == nil {
+				continue
+			}
+			if f, ok := rawFactory.(AssociatedDataFactory); ok {
+				ad, err = f.GetAssociatedData()
+				if err != nil {
+					return "", errutil.InternalError{Err: fmt.Sprintf("unable to get associated_data/additional_data from factory[%d]: %v", index, err)}
+				}
+			}
+		}
+		// Encrypt: get capsule, nonce, ciphertext (bind AD)
+		capsule, nonce, ct, err := kyber.Encrypt(pk, plaintext, ad)
 		if err != nil {
 			return "", errutil.InternalError{Err: fmt.Sprintf("Kyber encryption failed: %v", err)}
 		}

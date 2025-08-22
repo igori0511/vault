@@ -111,3 +111,7 @@ curl -sS -H "X-Vault-Token: $VAULT_TOKEN" -H "Content-Type: application/json" \
 
 {"errors":["provided nonce not allowed for this key"]}
 
+
+docs:
+http://localhost:3000/vault/docs/secrets/transit
+
