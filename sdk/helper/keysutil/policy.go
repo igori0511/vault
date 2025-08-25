@@ -1932,17 +1932,37 @@ func (p *Policy) RotateInMemory(randReader io.Reader) (retErr error) {
 
 		entry.RSAPublicKey = entry.RSAKey.Public().(*rsa.PublicKey)
 	case KeyType_Kyber512, KeyType_Kyber768, KeyType_Kyber1024:
-		// Initialize Kyber KEM
+		// Select the concrete Kyber variant (512/768/1024) and its protocol label.
+		// Using newKyberBox centralizes scheme selection and versioned domain separation.
 		kyber, err := newKyberBox(p.Type)
 		if err != nil {
-			return err
+			return err // internal/validated input: bubble up as-is
 		}
-		// Use Vault’s central RNG (HSM/DRBG if configured; crypto/rand otherwise)
+
+		// Draw seed material from Vault’s central CSPRNG.
+		//   • If an HSM/DRBG is configured, randReader is backed by it.
+		//   • Otherwise it falls back to crypto/rand.Reader.
+		// We intentionally use DeriveKeyPair(seed) to ensure *all* entropy originates
+		// from Vault’s RNG, with no hidden randomness inside the CIRCL library.
 		seed := make([]byte, kyber.s.SeedSize())
+		// io.ReadFull guarantees the entire seed is filled or an error is returned.
 		if _, err := io.ReadFull(randReader, seed); err != nil {
 			return fmt.Errorf("kyber seed read failed: %w", err)
 		}
+
+		// Deterministic key generation from explicit seed.
+		//   • Given the same (scheme, seed) → same (pk, sk).
+		//   • Since the seed is freshly random each time, keys remain unpredictable.
+		//   • Never reuse a seed across different keys.
 		pk, sk := kyber.s.DeriveKeyPair(seed)
+
+		// (Optional, defense-in-depth) Reduce secret lifetime in memory.
+		// If you have a zeroize/wipe helper, consider clearing the seed now:
+		// for i := range seed { seed[i] = 0 }
+
+		// Serialize keys to binary for storage/transport.
+		// Private key bytes are stored sealed at rest by Vault and are never exposed
+		// via read endpoints; public key bytes are safe to return to clients.
 		privBytes, err := sk.MarshalBinary()
 		if err != nil {
 			return fmt.Errorf("marshal Kyber private key: %w", err)
@@ -1952,6 +1972,9 @@ func (p *Policy) RotateInMemory(randReader io.Reader) (retErr error) {
 			return fmt.Errorf("marshal Kyber public key: %w", err)
 		}
 
+		// Persist into the key entry:
+		//   • entry.Key contains the raw private key bytes (Vault encrypts at rest).
+		//   • entry.FormattedPublicKey is a printable/base64-wrapped public key.
 		entry.Key = privBytes
 		entry.FormattedPublicKey = base64.StdEncoding.EncodeToString(pubBytes)
 
@@ -2405,27 +2428,42 @@ func (p *Policy) EncryptWithFactory(ver int, context []byte, nonce []byte, value
 			return "", err
 		}
 	case KeyType_Kyber512, KeyType_Kyber768, KeyType_Kyber1024:
-		// Initialize Kyber KEM
+		// Select and initialize the concrete Kyber variant (512/768/1024).
+		// newKyberBox encapsulates both the CIRCL scheme and a versioned label
+		// used later for domain separation in HKDF (inside kyber.Encrypt/Decrypt).
 		kyber, err := newKyberBox(p.Type)
 		if err != nil {
-			return "", err
+			return "", err // caller maps/handles internal errors appropriately
 		}
-		// Fetch the stored key entry
+
+		// Load the persisted key material for the requested key/version.
+		// This should contain the (sealed-at-rest) private key and a printable
+		// public key representation we expose to clients.
 		keyEntry, err := p.safeGetKeyEntry(ver)
 		if err != nil {
 			return "", err
 		}
-		// Decode the PEM‐style public key (base64 of raw bytes)
+
+		// Decode the printable public key.
+		// Note: we store the raw public key bytes base64-encoded (no PEM headers).
+		// Using base64 keeps the transport text-safe while preserving exact bytes.
 		pkBytes, err := base64.StdEncoding.DecodeString(keyEntry.FormattedPublicKey)
 		if err != nil {
 			return "", errutil.InternalError{Err: "failed to base64-decode Kyber public key"}
 		}
-		// Unmarshal raw public key
+
+		// Reconstruct the CIRCL public key from its binary form.
+		// If the bytes are malformed or of the wrong scheme/length, unmarshal fails.
 		pk, err := kyber.s.UnmarshalBinaryPublicKey(pkBytes)
 		if err != nil {
 			return "", errutil.InternalError{Err: fmt.Sprintf("failed to unmarshal Kyber public key: %v", err)}
 		}
-		// Optional associated data (AD) from factory, if provided
+
+		// Optionally gather Associated Data (AD) from any provided factories.
+		// AD is not encrypted but is authenticated by AEAD; it must be reproduced
+		// verbatim at decryption time. If multiple factories implement
+		// AssociatedDataFactory, the *last* one encountered wins (overwrites 'ad').
+		// If no factory provides AD, 'ad' remains nil (treated same as empty).
 		var ad []byte
 		for index, rawFactory := range factories {
 			if rawFactory == nil {
@@ -2438,17 +2476,35 @@ func (p *Policy) EncryptWithFactory(ver int, context []byte, nonce []byte, value
 				}
 			}
 		}
-		// Encrypt: get capsule, nonce, ciphertext (bind AD)
+
+		// Perform KEM-DEM encryption:
+		//   • KEM: encapsulate to recipient's pk → (capsule, shared secret).
+		//   • KDF: derive AES-256 key via HKDF-SHA256 bound to (capsule, AD, label).
+		//   • DEM: AES-256-GCM encrypt plaintext with AD as AdditionalData.
+		// On success we get:
+		//   capsule  – Kyber ciphertext (fixed size per scheme), public artifact
+		//   nonce    – random AEAD nonce (size = aead.NonceSize())
+		//   ct       – AEAD ciphertext (len >= plaintext + tag)
 		capsule, nonce, ct, err := kyber.Encrypt(pk, plaintext, ad)
 		if err != nil {
 			return "", errutil.InternalError{Err: fmt.Sprintf("Kyber encryption failed: %v", err)}
 		}
-		// Combine components: capsule || nonce || ciphertext
+
+		// Concatenate into a single payload to store/return:
+		//     combined = capsule || nonce || ct
+		// Delimiters are implicit:
+		//   • len(capsule)       = kyber.s.CiphertextSize()
+		//   • len(nonce)         = AEAD.NonceSize()
+		//   • remaining bytes    = ct
+		// Decryptors must split by these exact lengths to recover components.
 		combined := make([]byte, 0, len(capsule)+len(nonce)+len(ct))
 		combined = append(combined, capsule...)
 		combined = append(combined, nonce...)
 		combined = append(combined, ct...)
-		// Base64-encode and prefix with version
+
+		// The caller typically base64-encodes 'combined' and prefixes a version
+		// marker (e.g., "vault:v1:") for wire/storage. We hand back the raw blob
+		// here so upstream can apply its standard framing/encoding.
 		ciphertext = combined
 
 	default:
