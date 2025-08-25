@@ -1943,11 +1943,6 @@ func (p *Policy) RotateInMemory(randReader io.Reader) (retErr error) {
 			return fmt.Errorf("kyber seed read failed: %w", err)
 		}
 		pk, sk := kyber.s.DeriveKeyPair(seed)
-		// wipe seed defensively
-		for i := range seed {
-			seed[i] = 0
-		}
-
 		privBytes, err := sk.MarshalBinary()
 		if err != nil {
 			return fmt.Errorf("marshal Kyber private key: %w", err)
