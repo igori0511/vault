@@ -28,6 +28,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
+	"unsafe"
 
 	"github.com/cloudflare/circl/kem"
 	"github.com/cloudflare/circl/kem/kyber/kyber1024"
@@ -88,14 +90,14 @@ func (k kyberBox) Encrypt(pk kem.PublicKey, plaintext, ad []byte) (capsule, nonc
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("encapsulate: %w", err)
 	}
-	defer wipe(ss) // Best-effort zeroization of secret material.
+	defer k.wipe(ss) // Best-effort zeroization of secret material.
 
 	// HKDF expand into a 32-byte AES-256 key; bind to capsule and AD.
 	key, err := k.deriveAES256Key(ss, capsule, ad)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("derive key: %w", err)
 	}
-	defer wipe(key)
+	defer k.wipe(key)
 
 	// Initialize AEAD and create a fresh, random nonce of the correct size.
 	aead, n, err := k.newGCMWithNonce(key)
@@ -133,14 +135,14 @@ func (k kyberBox) Decrypt(sk kem.PrivateKey, capsule, nonce, ciphertext, ad []by
 	if err != nil {
 		return nil, errors.New("decryption failed")
 	}
-	defer wipe(ss)
+	defer k.wipe(ss)
 
 	// Derive the DEM key deterministically from (secret, capsule, AD).
 	key, err := k.deriveAES256Key(ss, capsule, ad)
 	if err != nil {
 		return nil, errors.New("decryption failed")
 	}
-	defer wipe(key)
+	defer k.wipe(key)
 
 	// Reconstruct AEAD and validate nonce size before decryption.
 	aead, err := k.newGCM(key)
@@ -216,11 +218,56 @@ func (k kyberBox) newGCM(key []byte) (cipher.AEAD, error) {
 	return aead, nil
 }
 
-// wipe zeroes sensitive byte slices in place. This is a best-effort measure;
-// the Go compiler/runtime may copy data during optimization, so absolute
-// guarantees are not possible. Still, this reduces the lifetime of secrets.
-func wipe(b []byte) {
-	for i := range b {
-		b[i] = 0
+// memclrNoHeapPointers is linked to runtime.memclrNoHeapPointers via go:linkname.
+//
+// It zeroes a memory region that is known to contain no Go heap pointers.
+// This is the same primitive the Go runtime uses to clear raw byte regions,
+// and is less likely to be optimized away than a manual loop or clear(b).
+//
+// ⚠️ Caveats:
+//   - This is an internal runtime symbol (non-API). Its signature or existence
+//     may change across Go releases.
+//   - Only use it on memory that does NOT contain pointers; otherwise, you
+//     may confuse the GC.
+//
+// If you prefer a libc-backed wipe with stronger “must perform” semantics and
+// can enable CGO, consider an alternative using explicit_bzero(3).
+//
+//go:linkname memclrNoHeapPointers runtime.memclrNoHeapPointers
+func memclrNoHeapPointers(ptr unsafe.Pointer, n uintptr)
+
+// wipe zeroes sensitive byte slices in place in a way that discourages
+// compiler/GC elision and reordering.
+//
+// Rationale:
+//   - Plain loops or clear(b) can be removed by dead-store elimination if
+//     the compiler proves the bytes are never observed afterward.
+//   - Calling the runtime primitive helps ensure the stores happen.
+//   - runtime.KeepAlive(b) keeps the slice's backing array considered live
+//     through this point, preventing premature liveness end that could
+//     allow the optimizer to move or drop the clear.
+//
+// Security notes:
+//   - This cannot erase prior copies (e.g., in registers, stack temporaries,
+//     or other aliases of the same backing array).
+//   - Keep secret lifetimes short; do not place secrets in pools.
+//   - For CGO builds, a libc explicit_bzero variant is another acceptable
+//     production approach.
+//
+// Usage:
+//
+//	defer k.wipe(sharedSecret)
+//	defer k.wipe(derivedKey)
+//
+//go:noinline
+func (k kyberBox) wipe(b []byte) {
+	if len(b) == 0 {
+		return
 	}
+	memclrNoHeapPointers(unsafe.Pointer(&b[0]), uintptr(len(b)))
+	/*
+		pins liveness through the wipe so the zeroing happens on the actual buffer that held the secret,
+		and can’t be optimized away or reordered past its last use.
+	*/
+	runtime.KeepAlive(b)
 }
