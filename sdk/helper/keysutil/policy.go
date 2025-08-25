@@ -225,13 +225,14 @@ func (kt KeyType) DerivationSupported() bool {
 	switch kt {
 	case KeyType_AES128_GCM96, KeyType_AES256_GCM96, KeyType_ChaCha20_Poly1305, KeyType_ED25519:
 		return true
+	default:
+		return false
 	}
-	return false
 }
 
 func (kt KeyType) AssociatedDataSupported() bool {
 	switch kt {
-	case KeyType_AES256_GCM96, KeyType_ChaCha20_Poly1305,
+	case KeyType_AES128_GCM96, KeyType_AES256_GCM96, KeyType_ChaCha20_Poly1305, KeyType_MANAGED_KEY,
 		KeyType_Kyber512, KeyType_Kyber768, KeyType_Kyber1024:
 		return true
 	default:
