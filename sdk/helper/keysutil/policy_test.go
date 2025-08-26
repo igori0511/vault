@@ -37,7 +37,7 @@ var allTestKeyTypes = []KeyType{
 	KeyType_AES256_GCM96, KeyType_ECDSA_P256, KeyType_ED25519, KeyType_RSA2048,
 	KeyType_RSA4096, KeyType_ChaCha20_Poly1305, KeyType_ECDSA_P384, KeyType_ECDSA_P521, KeyType_AES128_GCM96,
 	KeyType_RSA3072, KeyType_MANAGED_KEY, KeyType_HMAC, KeyType_AES128_CMAC, KeyType_AES256_CMAC, KeyType_ML_DSA,
-	KeyType_HYBRID, KeyType_AES192_CMAC, KeyType_SLH_DSA,
+	KeyType_HYBRID, KeyType_AES192_CMAC, KeyType_SLH_DSA, KeyType_Kyber512, KeyType_Kyber768, KeyType_Kyber1024,
 }
 
 func TestPolicy_KeyTypes(t *testing.T) {
@@ -82,6 +82,619 @@ func TestPolicy_HmacCmacSupported(t *testing.T) {
 				t.Fatalf("cmac should not have been supported for keytype %s", keyType.String())
 			}
 		}
+	}
+}
+
+func TestPolicy_Kyber_SupportedFeatures(t *testing.T) {
+	cases := []struct {
+		name string
+		kt   KeyType
+		str  string
+	}{
+		{"kyber512", KeyType_Kyber512, "kyber512"},
+		{"kyber768", KeyType_Kyber768, "kyber768"},
+		{"kyber1024", KeyType_Kyber1024, "kyber1024"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.kt.String(); got != c.str {
+				t.Fatalf("unexpected String(): %q", got)
+			}
+			if !c.kt.EncryptionSupported() {
+				t.Fatalf("encryption should be supported")
+			}
+			if !c.kt.DecryptionSupported() {
+				t.Fatalf("decryption should be supported")
+			}
+			if c.kt.SigningSupported() {
+				t.Fatalf("signing should not be supported")
+			}
+			if c.kt.DerivationSupported() {
+				t.Fatalf("derivation should not be supported")
+			}
+			if !c.kt.AssociatedDataSupported() {
+				t.Fatalf("associated data should not be supported")
+			}
+			if c.kt.PaddingSchemesSupported() {
+				t.Fatalf("RSA padding should not be supported")
+			}
+			if c.kt.ImportPublicKeySupported() {
+				t.Fatalf("public key import should not be supported")
+			}
+			if c.kt.IsPQC() {
+				t.Fatalf("IsPQC should be false per current policy logic")
+			}
+			if !c.kt.HMACSupported() {
+				t.Fatalf("HMAC should be supported")
+			}
+		})
+	}
+}
+
+func TestPolicy_Kyber_DecryptWithFactory_RoundTrip(t *testing.T) {
+	cases := []struct {
+		name string
+		kt   KeyType
+	}{
+		{"kyber512", KeyType_Kyber512},
+		{"kyber768", KeyType_Kyber768},
+		{"kyber1024", KeyType_Kyber1024},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			p := &Policy{Name: c.name + "-roundtrip", Type: c.kt}
+			if err := p.RotateInMemory(rand.Reader); err != nil {
+				t.Fatalf("RotateInMemory: %v", err)
+			}
+			if p.LatestVersion != 1 {
+				t.Fatalf("LatestVersion=%d", p.LatestVersion)
+			}
+			plain := []byte("the quick brown fox")
+			plainB64 := base64.StdEncoding.EncodeToString(plain)
+			ct, err := p.EncryptWithFactory(0, nil, nil, plainB64)
+			if err != nil {
+				t.Fatalf("EncryptWithFactory: %v", err)
+			}
+			prefix := p.getVersionPrefix(1)
+			if !strings.HasPrefix(ct, prefix) {
+				t.Fatalf("missing v1 prefix: %q", ct)
+			}
+			ptB64, err := p.DecryptWithFactory(nil, nil, ct)
+			if err != nil {
+				t.Fatalf("DecryptWithFactory: %v", err)
+			}
+			pt, err := base64.StdEncoding.DecodeString(ptB64)
+			if err != nil {
+				t.Fatalf("b64 decode: %v", err)
+			}
+			if string(pt) != string(plain) {
+				t.Fatalf("round-trip mismatch: %q vs %q", string(pt), string(plain))
+			}
+		})
+	}
+}
+
+func TestPolicy_Kyber_DecryptWithFactory_TamperedCapsule(t *testing.T) {
+	cases := []struct {
+		name string
+		kt   KeyType
+	}{
+		{"kyber512", KeyType_Kyber512},
+		{"kyber768", KeyType_Kyber768},
+		{"kyber1024", KeyType_Kyber1024},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			p := &Policy{Name: c.name + "-neg", Type: c.kt}
+			if err := p.RotateInMemory(rand.Reader); err != nil {
+				t.Fatalf("RotateInMemory: %v", err)
+			}
+			if p.LatestVersion != 1 {
+				t.Fatalf("LatestVersion=%d", p.LatestVersion)
+			}
+			plainB64 := base64.StdEncoding.EncodeToString([]byte("attack at dawn"))
+			ct, err := p.EncryptWithFactory(0, nil, nil, plainB64)
+			if err != nil {
+				t.Fatalf("EncryptWithFactory: %v", err)
+			}
+			prefix := p.getVersionPrefix(1)
+			if !strings.HasPrefix(ct, prefix) {
+				t.Fatalf("missing v1 prefix: %q", ct)
+			}
+			b64 := strings.TrimPrefix(ct, prefix)
+			combined, err := base64.StdEncoding.DecodeString(b64)
+			if err != nil {
+				t.Fatalf("b64: %v", err)
+			}
+			if len(combined) == 0 {
+				t.Fatal("empty combined")
+			}
+			combined[0] ^= 0x01
+			badCT := prefix + base64.StdEncoding.EncodeToString(combined)
+			if _, err := p.DecryptWithFactory(nil, nil, badCT); err == nil {
+				t.Fatal("expected error on tampered capsule")
+			}
+		})
+	}
+}
+
+func TestPolicy_Kyber_DecryptWithFactory_TamperedCiphertext(t *testing.T) {
+	cases := []struct {
+		name string
+		kt   KeyType
+	}{
+		{"kyber512", KeyType_Kyber512},
+		{"kyber768", KeyType_Kyber768},
+		{"kyber1024", KeyType_Kyber1024},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			p := &Policy{Name: c.name + "-neg-ct", Type: c.kt}
+			if err := p.RotateInMemory(rand.Reader); err != nil {
+				t.Fatalf("RotateInMemory: %v", err)
+			}
+			if p.LatestVersion != 1 {
+				t.Fatalf("LatestVersion=%d", p.LatestVersion)
+			}
+			plainB64 := base64.StdEncoding.EncodeToString([]byte("lorem ipsum"))
+			ct, err := p.EncryptWithFactory(0, nil, nil, plainB64)
+			if err != nil {
+				t.Fatalf("EncryptWithFactory: %v", err)
+			}
+			prefix := p.getVersionPrefix(1)
+			if !strings.HasPrefix(ct, prefix) {
+				t.Fatalf("missing v1 prefix: %q", ct)
+			}
+			b64 := strings.TrimPrefix(ct, prefix)
+			combined, err := base64.StdEncoding.DecodeString(b64)
+			if err != nil {
+				t.Fatalf("b64: %v", err)
+			}
+			if len(combined) == 0 {
+				t.Fatal("empty combined")
+			}
+			combined[len(combined)-1] ^= 0x01
+			badCT := prefix + base64.StdEncoding.EncodeToString(combined)
+			if _, err := p.DecryptWithFactory(nil, nil, badCT); err == nil {
+				t.Fatal("expected error on tampered ciphertext")
+			}
+		})
+	}
+}
+
+func TestPolicy_Kyber_DecryptWithFactory_VersionTooNew(t *testing.T) {
+	cases := []struct {
+		name string
+		kt   KeyType
+	}{
+		{"kyber512", KeyType_Kyber512},
+		{"kyber768", KeyType_Kyber768},
+		{"kyber1024", KeyType_Kyber1024},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			p := &Policy{Name: c.name + "-neg-version", Type: c.kt}
+			if err := p.RotateInMemory(rand.Reader); err != nil {
+				t.Fatalf("RotateInMemory: %v", err)
+			}
+			if p.LatestVersion != 1 {
+				t.Fatalf("LatestVersion=%d", p.LatestVersion)
+			}
+			plainB64 := base64.StdEncoding.EncodeToString([]byte("version test"))
+			ct, err := p.EncryptWithFactory(0, nil, nil, plainB64)
+			if err != nil {
+				t.Fatalf("EncryptWithFactory: %v", err)
+			}
+			v1 := p.getVersionPrefix(1)
+			v2 := p.getVersionPrefix(2)
+			if !strings.HasPrefix(ct, v1) {
+				t.Fatalf("missing v1 prefix: %q", ct)
+			}
+			badCT := strings.Replace(ct, v1, v2, 1)
+			if _, err := p.DecryptWithFactory(nil, nil, badCT); err == nil {
+				t.Fatal("expected error for too-new version")
+			}
+		})
+	}
+}
+
+func TestPolicy_Kyber_DecryptWithFactory_WrongNumberOfFields(t *testing.T) {
+	cases := []struct {
+		name string
+		kt   KeyType
+	}{
+		{"kyber512", KeyType_Kyber512},
+		{"kyber768", KeyType_Kyber768},
+		{"kyber1024", KeyType_Kyber1024},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			p := &Policy{Name: c.name + "-neg-fields", Type: c.kt}
+			if err := p.RotateInMemory(rand.Reader); err != nil {
+				t.Fatalf("RotateInMemory: %v", err)
+			}
+			if p.LatestVersion != 1 {
+				t.Fatalf("LatestVersion=%d", p.LatestVersion)
+			}
+			plainB64 := base64.StdEncoding.EncodeToString([]byte("field count test"))
+			ct, err := p.EncryptWithFactory(0, nil, nil, plainB64)
+			if err != nil {
+				t.Fatalf("EncryptWithFactory: %v", err)
+			}
+			v1 := p.getVersionPrefix(1)
+			if !strings.HasPrefix(ct, v1) {
+				t.Fatalf("missing v1 prefix: %q", ct)
+			}
+			badCT := strings.Replace(ct, v1, "vault:v1", 1)
+			if _, err := p.DecryptWithFactory(nil, nil, badCT); err == nil {
+				t.Fatal("expected error for wrong number of fields")
+			}
+		})
+	}
+}
+
+// TestAssociatedDataFactory is a mock factory for testing associated data functionality
+type TestAssociatedDataFactory struct {
+	data []byte
+	err  error
+}
+
+func (f *TestAssociatedDataFactory) GetAssociatedData() ([]byte, error) {
+	return f.data, f.err
+}
+
+func TestPolicy_Kyber_AssociatedData_RoundTrip(t *testing.T) {
+	cases := []struct {
+		name string
+		kt   KeyType
+	}{
+		{"kyber512", KeyType_Kyber512},
+		{"kyber768", KeyType_Kyber768},
+		{"kyber1024", KeyType_Kyber1024},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			p := &Policy{Name: c.name + "-ad-roundtrip", Type: c.kt}
+			if err := p.RotateInMemory(rand.Reader); err != nil {
+				t.Fatalf("RotateInMemory: %v", err)
+			}
+
+			if p.LatestVersion != 1 {
+				t.Fatalf("LatestVersion=%d", p.LatestVersion)
+			}
+
+			plain := []byte("kyber associated data test")
+			plainB64 := base64.StdEncoding.EncodeToString(plain)
+			associatedData := []byte("test-associated-data-kyber")
+
+			adFactory := &TestAssociatedDataFactory{data: associatedData}
+
+			// Encrypt with associated data
+			ct, err := p.EncryptWithFactory(0, nil, nil, plainB64, adFactory)
+			if err != nil {
+				t.Fatalf("EncryptWithFactory: %v", err)
+			}
+
+			prefix := p.getVersionPrefix(1)
+			if !strings.HasPrefix(ct, prefix) {
+				t.Fatalf("missing v1 prefix: %q", ct)
+			}
+
+			// Decrypt with same associated data
+			ptB64, err := p.DecryptWithFactory(nil, nil, ct, adFactory)
+			if err != nil {
+				t.Fatalf("DecryptWithFactory: %v", err)
+			}
+
+			pt, err := base64.StdEncoding.DecodeString(ptB64)
+			if err != nil {
+				t.Fatalf("b64 decode: %v", err)
+			}
+
+			if string(pt) != string(plain) {
+				t.Fatalf("round-trip mismatch: %q vs %q", string(pt), string(plain))
+			}
+		})
+	}
+}
+
+func TestPolicy_Kyber_AssociatedData_WrongAD_Decrypt(t *testing.T) {
+	cases := []struct {
+		name string
+		kt   KeyType
+	}{
+		{"kyber512", KeyType_Kyber512},
+		{"kyber768", KeyType_Kyber768},
+		{"kyber1024", KeyType_Kyber1024},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			p := &Policy{Name: c.name + "-ad-wrong", Type: c.kt}
+			if err := p.RotateInMemory(rand.Reader); err != nil {
+				t.Fatalf("RotateInMemory: %v", err)
+			}
+
+			if p.LatestVersion != 1 {
+				t.Fatalf("LatestVersion=%d", p.LatestVersion)
+			}
+
+			plain := []byte("wrong associated data test")
+			plainB64 := base64.StdEncoding.EncodeToString(plain)
+
+			// Encrypt with one associated data
+			encryptAD := []byte("encrypt-associated-data")
+			encryptFactory := &TestAssociatedDataFactory{data: encryptAD}
+
+			ct, err := p.EncryptWithFactory(0, nil, nil, plainB64, encryptFactory)
+			if err != nil {
+				t.Fatalf("EncryptWithFactory: %v", err)
+			}
+
+			// Try to decrypt with different associated data - should fail
+			decryptAD := []byte("decrypt-associated-data-different")
+			decryptFactory := &TestAssociatedDataFactory{data: decryptAD}
+
+			_, err = p.DecryptWithFactory(nil, nil, ct, decryptFactory)
+			if err == nil {
+				t.Fatal("expected error when decrypting with wrong associated data")
+			}
+			// message can be "decryption failed: invalid ciphertext"
+			if !strings.Contains(strings.ToLower(err.Error()), "decryption failed") {
+				t.Fatalf("unexpected error message: %v", err)
+			}
+		})
+	}
+}
+
+func TestPolicy_Kyber_AssociatedData_Empty(t *testing.T) {
+	cases := []struct {
+		name string
+		kt   KeyType
+	}{
+		{"kyber512", KeyType_Kyber512},
+		{"kyber768", KeyType_Kyber768},
+		{"kyber1024", KeyType_Kyber1024},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			p := &Policy{Name: c.name + "-ad-empty", Type: c.kt}
+			if err := p.RotateInMemory(rand.Reader); err != nil {
+				t.Fatalf("RotateInMemory: %v", err)
+			}
+
+			if p.LatestVersion != 1 {
+				t.Fatalf("LatestVersion=%d", p.LatestVersion)
+			}
+
+			plain := []byte("empty associated data test")
+			plainB64 := base64.StdEncoding.EncodeToString(plain)
+
+			// Use empty associated data
+			emptyADFactory := &TestAssociatedDataFactory{data: []byte{}}
+
+			ct, err := p.EncryptWithFactory(0, nil, nil, plainB64, emptyADFactory)
+			if err != nil {
+				t.Fatalf("EncryptWithFactory: %v", err)
+			}
+
+			// Decrypt with empty AD factory
+			ptB64, err := p.DecryptWithFactory(nil, nil, ct, emptyADFactory)
+			if err != nil {
+				t.Fatalf("DecryptWithFactory: %v", err)
+			}
+
+			pt, err := base64.StdEncoding.DecodeString(ptB64)
+			if err != nil {
+				t.Fatalf("b64 decode: %v", err)
+			}
+
+			if string(pt) != string(plain) {
+				t.Fatalf("round-trip mismatch: %q vs %q", string(pt), string(plain))
+			}
+
+			// Empty AD should be equivalent to nil AD:
+			// 1) Encrypt without any factory (nil AD)
+			ctNoAD, err := p.EncryptWithFactory(0, nil, nil, plainB64)
+			if err != nil {
+				t.Fatalf("EncryptWithFactory (no AD): %v", err)
+			}
+			// Decrypt ciphertext with nil AD using empty AD factory should succeed
+			if _, err = p.DecryptWithFactory(nil, nil, ctNoAD, emptyADFactory); err != nil {
+				t.Fatalf("DecryptWithFactory (nil AD ciphertext, empty AD factory) failed: %v", err)
+			}
+			// Decrypt ciphertext made with empty AD but without a factory (nil AD) should also succeed
+			if _, err = p.DecryptWithFactory(nil, nil, ct); err != nil {
+				t.Fatalf("DecryptWithFactory (empty AD ciphertext, no factory) failed: %v", err)
+			}
+		})
+	}
+}
+
+func TestPolicy_Kyber_AssociatedData_FactoryError(t *testing.T) {
+	cases := []struct {
+		name string
+		kt   KeyType
+	}{
+		{"kyber512", KeyType_Kyber512},
+		{"kyber768", KeyType_Kyber768},
+		{"kyber1024", KeyType_Kyber1024},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			p := &Policy{Name: c.name + "-ad-error", Type: c.kt}
+			if err := p.RotateInMemory(rand.Reader); err != nil {
+				t.Fatalf("RotateInMemory: %v", err)
+			}
+
+			if p.LatestVersion != 1 {
+				t.Fatalf("LatestVersion=%d", p.LatestVersion)
+			}
+
+			plain := []byte("factory error test")
+			plainB64 := base64.StdEncoding.EncodeToString(plain)
+
+			// Factory that errors
+			errorFactory := &TestAssociatedDataFactory{
+				data: []byte("some data"),
+				err:  errors.New("factory error"),
+			}
+
+			// Encryption should fail
+			_, err := p.EncryptWithFactory(0, nil, nil, plainB64, errorFactory)
+			if err == nil {
+				t.Fatal("expected error from factory during encryption")
+			}
+			// match current error text which mentions "associated_data/additional_data"
+			if !strings.Contains(err.Error(), "unable to get associated_data") {
+				t.Fatalf("unexpected error message: %v", err)
+			}
+
+			// Good encrypt; error on decrypt
+			goodFactory := &TestAssociatedDataFactory{data: []byte("good data")}
+			ct, err := p.EncryptWithFactory(0, nil, nil, plainB64, goodFactory)
+			if err != nil {
+				t.Fatalf("EncryptWithFactory: %v", err)
+			}
+
+			// Decryption should fail with error factory
+			_, err = p.DecryptWithFactory(nil, nil, ct, errorFactory)
+			if err == nil {
+				t.Fatal("expected error from factory during decryption")
+			}
+			if !strings.Contains(err.Error(), "unable to get associated_data") {
+				t.Fatalf("unexpected error message: %v", err)
+			}
+		})
+	}
+}
+
+func TestPolicy_Kyber_AssociatedData_LargeData(t *testing.T) {
+	cases := []struct {
+		name string
+		kt   KeyType
+	}{
+		{"kyber512", KeyType_Kyber512},
+		{"kyber768", KeyType_Kyber768},
+		{"kyber1024", KeyType_Kyber1024},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			p := &Policy{Name: c.name + "-ad-large", Type: c.kt}
+			if err := p.RotateInMemory(rand.Reader); err != nil {
+				t.Fatalf("RotateInMemory: %v", err)
+			}
+
+			if p.LatestVersion != 1 {
+				t.Fatalf("LatestVersion=%d", p.LatestVersion)
+			}
+
+			plain := []byte("large associated data test")
+			plainB64 := base64.StdEncoding.EncodeToString(plain)
+
+			// Large associated data (1KB)
+			largeAD := make([]byte, 1024)
+			for i := range largeAD {
+				largeAD[i] = byte(i % 256)
+			}
+
+			largeADFactory := &TestAssociatedDataFactory{data: largeAD}
+
+			ct, err := p.EncryptWithFactory(0, nil, nil, plainB64, largeADFactory)
+			if err != nil {
+				t.Fatalf("EncryptWithFactory: %v", err)
+			}
+
+			ptB64, err := p.DecryptWithFactory(nil, nil, ct, largeADFactory)
+			if err != nil {
+				t.Fatalf("DecryptWithFactory: %v", err)
+			}
+
+			pt, err := base64.StdEncoding.DecodeString(ptB64)
+			if err != nil {
+				t.Fatalf("b64 decode: %v", err)
+			}
+
+			if string(pt) != string(plain) {
+				t.Fatalf("round-trip mismatch: %q vs %q", string(pt), string(plain))
+			}
+		})
+	}
+}
+
+func TestPolicy_Kyber_AssociatedData_MultipleFactories(t *testing.T) {
+	cases := []struct {
+		name string
+		kt   KeyType
+	}{
+		{"kyber512", KeyType_Kyber512},
+		{"kyber768", KeyType_Kyber768},
+		{"kyber1024", KeyType_Kyber1024},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			p := &Policy{Name: c.name + "-ad-multi", Type: c.kt}
+			if err := p.RotateInMemory(rand.Reader); err != nil {
+				t.Fatalf("RotateInMemory: %v", err)
+			}
+
+			if p.LatestVersion != 1 {
+				t.Fatalf("LatestVersion=%d", p.LatestVersion)
+			}
+
+			plain := []byte("multiple factories test")
+			plainB64 := base64.StdEncoding.EncodeToString(plain)
+
+			// With multiple factories, match existing style: last AssociatedDataFactory wins
+			firstADFactory := &TestAssociatedDataFactory{data: []byte("first-ad")}
+			secondADFactory := &TestAssociatedDataFactory{data: []byte("second-ad")}
+
+			// Mix with nil factory to test robustness
+			var nilFactory interface{} = nil
+
+			ct, err := p.EncryptWithFactory(0, nil, nil, plainB64,
+				nilFactory, firstADFactory, secondADFactory)
+			if err != nil {
+				t.Fatalf("EncryptWithFactory: %v", err)
+			}
+
+			// Decrypt with second (last) factory should work
+			ptB64, err := p.DecryptWithFactory(nil, nil, ct, secondADFactory)
+			if err != nil {
+				t.Fatalf("DecryptWithFactory with second factory: %v", err)
+			}
+
+			pt, err := base64.StdEncoding.DecodeString(ptB64)
+			if err != nil {
+				t.Fatalf("b64 decode: %v", err)
+			}
+
+			if string(pt) != string(plain) {
+				t.Fatalf("round-trip mismatch: %q vs %q", string(pt), string(plain))
+			}
+
+			// Decrypt with first factory should fail (last-wins semantics)
+			_, err = p.DecryptWithFactory(nil, nil, ct, firstADFactory)
+			if err == nil {
+				t.Fatal("expected error when decrypting with first factory")
+			}
+		})
 	}
 }
 

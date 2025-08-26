@@ -76,6 +76,9 @@ const (
 	KeyType_HYBRID
 	KeyType_AES192_CMAC
 	KeyType_SLH_DSA
+	KeyType_Kyber512
+	KeyType_Kyber768
+	KeyType_Kyber1024
 	// If adding to this list please update allTestKeyTypes in policy_test.go
 )
 
@@ -188,7 +191,7 @@ type KeyType int
 
 func (kt KeyType) EncryptionSupported() bool {
 	switch kt {
-	case KeyType_AES128_GCM96, KeyType_AES256_GCM96, KeyType_ChaCha20_Poly1305, KeyType_RSA2048, KeyType_RSA3072, KeyType_RSA4096, KeyType_MANAGED_KEY:
+	case KeyType_Kyber512, KeyType_Kyber768, KeyType_Kyber1024, KeyType_AES128_GCM96, KeyType_AES256_GCM96, KeyType_ChaCha20_Poly1305, KeyType_RSA2048, KeyType_RSA3072, KeyType_RSA4096, KeyType_MANAGED_KEY:
 		return true
 	}
 	return false
@@ -196,7 +199,7 @@ func (kt KeyType) EncryptionSupported() bool {
 
 func (kt KeyType) DecryptionSupported() bool {
 	switch kt {
-	case KeyType_AES128_GCM96, KeyType_AES256_GCM96, KeyType_ChaCha20_Poly1305, KeyType_RSA2048, KeyType_RSA3072, KeyType_RSA4096, KeyType_MANAGED_KEY:
+	case KeyType_Kyber512, KeyType_Kyber768, KeyType_Kyber1024, KeyType_AES128_GCM96, KeyType_AES256_GCM96, KeyType_ChaCha20_Poly1305, KeyType_RSA2048, KeyType_RSA3072, KeyType_RSA4096, KeyType_MANAGED_KEY:
 		return true
 	}
 	return false
@@ -222,16 +225,19 @@ func (kt KeyType) DerivationSupported() bool {
 	switch kt {
 	case KeyType_AES128_GCM96, KeyType_AES256_GCM96, KeyType_ChaCha20_Poly1305, KeyType_ED25519:
 		return true
+	default:
+		return false
 	}
-	return false
 }
 
 func (kt KeyType) AssociatedDataSupported() bool {
 	switch kt {
-	case KeyType_AES128_GCM96, KeyType_AES256_GCM96, KeyType_ChaCha20_Poly1305, KeyType_MANAGED_KEY:
+	case KeyType_AES128_GCM96, KeyType_AES256_GCM96, KeyType_ChaCha20_Poly1305, KeyType_MANAGED_KEY,
+		KeyType_Kyber512, KeyType_Kyber768, KeyType_Kyber1024:
 		return true
+	default:
+		return false
 	}
-	return false
 }
 
 func (kt KeyType) CMACSupported() bool {
@@ -318,6 +324,12 @@ func (kt KeyType) String() string {
 		return "aes192-cmac"
 	case KeyType_SLH_DSA:
 		return "slh-dsa"
+	case KeyType_Kyber512:
+		return "kyber512"
+	case KeyType_Kyber768:
+		return "kyber768"
+	case KeyType_Kyber1024:
+		return "kyber1024"
 	}
 
 	return "[unknown]"
@@ -1182,6 +1194,74 @@ func (p *Policy) DecryptWithFactory(context, nonce []byte, value string, factori
 		if err != nil {
 			return "", err
 		}
+	case KeyType_Kyber512, KeyType_Kyber768, KeyType_Kyber1024:
+		kyber, err := newKyberBox(p.Type)
+		if err != nil {
+			return "", err
+		}
+
+		tpl := p.getVersionPrefix(ver)
+		if !strings.HasPrefix(value, tpl) {
+			return "", errutil.UserError{Err: "invalid ciphertext: version prefix missing"}
+		}
+
+		b64 := strings.TrimPrefix(value, tpl)
+		combined, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			return "", errutil.UserError{Err: "invalid ciphertext: base64 decode failed"}
+		}
+
+		// Frame: combined = capsule || nonce || ct
+		capsuleLen := kyber.s.CiphertextSize()
+		if len(combined) < capsuleLen+1 { // need at least some nonce/ct bytes
+			return "", errutil.InternalError{Err: "invalid ciphertext: too short"}
+		}
+		capsule := combined[:capsuleLen]
+		rest := combined[capsuleLen:]
+
+		// Load private key for this version
+		keyEntry, err := p.safeGetKeyEntry(ver)
+		if err != nil {
+			return "", err
+		}
+		sk, err := kyber.s.UnmarshalBinaryPrivateKey(keyEntry.Key)
+		if err != nil {
+			return "", errutil.InternalError{Err: fmt.Sprintf("failed to unmarshal Kyber private key: %v", err)}
+		}
+
+		// Optional associated data (AD) from factory, if provided (last-wins)
+		var ad []byte
+		for index, rawFactory := range factories {
+			if rawFactory == nil {
+				continue
+			}
+			if f, ok := rawFactory.(AssociatedDataFactory); ok {
+				ad, err = f.GetAssociatedData()
+				if err != nil {
+					return "", errutil.InternalError{Err: fmt.Sprintf("unable to get associated_data/additional_data from factory[%d]: %v", index, err)}
+				}
+			}
+		}
+
+		// Split nonce and ciphertext (AES-GCM uses a 96-bit/12-byte nonce)
+		const nonceLen = 12
+		if len(rest) < nonceLen+1 { // require at least 1 byte of ciphertext
+			return "", errutil.InternalError{Err: "invalid ciphertext: too short"}
+		}
+		nonce := rest[:nonceLen]
+		ct := rest[nonceLen:]
+
+		// Use kyberBox.Decrypt to avoid duplicating crypto flow
+		pt, err := kyber.Decrypt(sk, capsule, nonce, ct, ad)
+		if err != nil {
+			// Map AEAD/AAD mismatch to user error; everything else -> internal
+			if strings.Contains(err.Error(), "decryption failed") {
+				return "", errutil.UserError{Err: "decryption failed: invalid ciphertext"}
+			}
+			return "", errutil.InternalError{Err: fmt.Sprintf("Kyber decryption failed: %v", err)}
+		}
+
+		plain = pt
 
 	default:
 		return "", errutil.InternalError{Err: fmt.Sprintf("unsupported key type %v", p.Type)}
@@ -1851,6 +1931,48 @@ func (p *Policy) RotateInMemory(randReader io.Reader) (retErr error) {
 		}
 
 		entry.RSAPublicKey = entry.RSAKey.Public().(*rsa.PublicKey)
+	case KeyType_Kyber512, KeyType_Kyber768, KeyType_Kyber1024:
+		// Select the concrete Kyber variant (512/768/1024) and its protocol label.
+		// Using newKyberBox centralizes scheme selection and versioned domain separation.
+		kyber, err := newKyberBox(p.Type)
+		if err != nil {
+			return err // internal/validated input: bubble up as-is
+		}
+
+		// Draw seed material from Vault’s central CSPRNG.
+		//   • If an HSM/DRBG is configured, randReader is backed by it.
+		//   • Otherwise it falls back to crypto/rand.Reader.
+		// We intentionally use DeriveKeyPair(seed) to ensure *all* entropy originates
+		// from Vault’s RNG, with no hidden randomness inside the CIRCL library.
+		seed := make([]byte, kyber.s.SeedSize())
+		// io.ReadFull guarantees the entire seed is filled or an error is returned.
+		if _, err := io.ReadFull(randReader, seed); err != nil {
+			return fmt.Errorf("kyber seed read failed: %w", err)
+		}
+
+		// Deterministic key generation from explicit seed.
+		//   • Given the same (scheme, seed) → same (pk, sk).
+		//   • Since the seed is freshly random each time, keys remain unpredictable.
+		//   • Never reuse a seed across different keys.
+		pk, sk := kyber.s.DeriveKeyPair(seed)
+
+		// Serialize keys to binary for storage/transport.
+		// Private key bytes are stored sealed at rest by Vault and are never exposed
+		// via read endpoints; public key bytes are safe to return to clients.
+		privBytes, err := sk.MarshalBinary()
+		if err != nil {
+			return fmt.Errorf("marshal Kyber private key: %w", err)
+		}
+		pubBytes, err := pk.MarshalBinary()
+		if err != nil {
+			return fmt.Errorf("marshal Kyber public key: %w", err)
+		}
+
+		// Persist into the key entry:
+		//   • entry.Key contains the raw private key bytes (Vault encrypts at rest).
+		//   • entry.FormattedPublicKey is a printable/base64-wrapped public key.
+		entry.Key = privBytes
+		entry.FormattedPublicKey = base64.StdEncoding.EncodeToString(pubBytes)
 
 	default:
 		if err := entRotateInMemory(p, &entry, randReader); err != nil {
@@ -2301,6 +2423,85 @@ func (p *Policy) EncryptWithFactory(ver int, context []byte, nonce []byte, value
 		if err != nil {
 			return "", err
 		}
+	case KeyType_Kyber512, KeyType_Kyber768, KeyType_Kyber1024:
+		// Select and initialize the concrete Kyber variant (512/768/1024).
+		// newKyberBox encapsulates both the CIRCL scheme and a versioned label
+		// used later for domain separation in HKDF (inside kyber.Encrypt/Decrypt).
+		kyber, err := newKyberBox(p.Type)
+		if err != nil {
+			return "", err // caller maps/handles internal errors appropriately
+		}
+
+		// Load the persisted key material for the requested key/version.
+		// This should contain the (sealed-at-rest) private key and a printable
+		// public key representation we expose to clients.
+		keyEntry, err := p.safeGetKeyEntry(ver)
+		if err != nil {
+			return "", err
+		}
+
+		// Decode the printable public key.
+		// Note: we store the raw public key bytes base64-encoded (no PEM headers).
+		// Using base64 keeps the transport text-safe while preserving exact bytes.
+		pkBytes, err := base64.StdEncoding.DecodeString(keyEntry.FormattedPublicKey)
+		if err != nil {
+			return "", errutil.InternalError{Err: "failed to base64-decode Kyber public key"}
+		}
+
+		// Reconstruct the CIRCL public key from its binary form.
+		// If the bytes are malformed or of the wrong scheme/length, unmarshal fails.
+		pk, err := kyber.s.UnmarshalBinaryPublicKey(pkBytes)
+		if err != nil {
+			return "", errutil.InternalError{Err: fmt.Sprintf("failed to unmarshal Kyber public key: %v", err)}
+		}
+
+		// Optionally gather Associated Data (AD) from any provided factories.
+		// AD is not encrypted but is authenticated by AEAD; it must be reproduced
+		// verbatim at decryption time. If multiple factories implement
+		// AssociatedDataFactory, the *last* one encountered wins (overwrites 'ad').
+		// If no factory provides AD, 'ad' remains nil (treated same as empty).
+		var ad []byte
+		for index, rawFactory := range factories {
+			if rawFactory == nil {
+				continue
+			}
+			if f, ok := rawFactory.(AssociatedDataFactory); ok {
+				ad, err = f.GetAssociatedData()
+				if err != nil {
+					return "", errutil.InternalError{Err: fmt.Sprintf("unable to get associated_data/additional_data from factory[%d]: %v", index, err)}
+				}
+			}
+		}
+
+		// Perform KEM-DEM encryption:
+		//   • KEM: encapsulate to recipient's pk → (capsule, shared secret).
+		//   • KDF: derive AES-256 key via HKDF-SHA256 bound to (capsule, AD, label).
+		//   • DEM: AES-256-GCM encrypt plaintext with AD as AdditionalData.
+		// On success we get:
+		//   capsule  – Kyber ciphertext (fixed size per scheme), public artifact
+		//   nonce    – random AEAD nonce (size = aead.NonceSize())
+		//   ct       – AEAD ciphertext
+		capsule, nonce, ct, err := kyber.Encrypt(pk, plaintext, ad)
+		if err != nil {
+			return "", errutil.InternalError{Err: fmt.Sprintf("Kyber encryption failed: %v", err)}
+		}
+
+		// Concatenate into a single payload to store/return:
+		//     combined = capsule || nonce || ct
+		// Delimiters are implicit:
+		//   • len(capsule)       = kyber.s.CiphertextSize()
+		//   • len(nonce)         = AEAD.NonceSize()
+		//   • remaining bytes    = ct
+		// Decryptors must split by these exact lengths to recover components.
+		combined := make([]byte, 0, len(capsule)+len(nonce)+len(ct))
+		combined = append(combined, capsule...)
+		combined = append(combined, nonce...)
+		combined = append(combined, ct...)
+
+		// The caller typically base64-encodes 'combined' and prefixes a version
+		// marker (e.g., "vault:v1:") for wire/storage. We hand back the raw blob
+		// here so upstream can apply its standard framing/encoding.
+		ciphertext = combined
 
 	default:
 		return "", errutil.InternalError{Err: fmt.Sprintf("unsupported key type %v", p.Type)}

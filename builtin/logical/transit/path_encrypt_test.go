@@ -5,6 +5,7 @@ package transit
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -1063,5 +1064,402 @@ func TestTransit_EncryptWithRSAPublicKey(t *testing.T) {
 	_, err = b.HandleRequest(context.Background(), req)
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestTransit_EncryptWithKyber(t *testing.T) {
+	variants := []string{"kyber512", "kyber768", "kyber1024"}
+
+	for _, keyType := range variants {
+		t.Run(keyType, func(t *testing.T) {
+			b, s := createBackendWithStorage(t)
+
+			// Create Kyber key of requested variant
+			policyReq := &logical.Request{
+				Operation: logical.UpdateOperation,
+				Path:      "keys/kyber_key_" + keyType,
+				Storage:   s,
+				Data: map[string]interface{}{
+					"type": keyType,
+				},
+			}
+			resp, err := b.HandleRequest(context.Background(), policyReq)
+			if err != nil || (resp != nil && resp.IsError()) {
+				t.Fatalf("err:%v resp:%#v", err, resp)
+			}
+
+			plaintext := "dGhlIHF1aWNrIGJyb3duIGZveA=="
+
+			encReq := &logical.Request{
+				Operation: logical.UpdateOperation,
+				Path:      "encrypt/kyber_key_" + keyType,
+				Storage:   s,
+				Data: map[string]interface{}{
+					"plaintext": plaintext,
+				},
+			}
+			resp, err = b.HandleRequest(context.Background(), encReq)
+			if err != nil || (resp != nil && resp.IsError()) {
+				t.Fatalf("err:%v resp:%#v", err, resp)
+			}
+
+			if kv := resp.Data["key_version"].(int); kv != 1 {
+				t.Fatalf("unexpected key version; got: %d, expected: %d", kv, 1)
+			}
+
+			ciphertext := resp.Data["ciphertext"]
+			decReq := &logical.Request{
+				Operation: logical.UpdateOperation,
+				Path:      "decrypt/kyber_key_" + keyType,
+				Storage:   s,
+				Data: map[string]interface{}{
+					"ciphertext": ciphertext,
+				},
+			}
+			resp, err = b.HandleRequest(context.Background(), decReq)
+			if err != nil || (resp != nil && resp.IsError()) {
+				t.Fatalf("err:%v resp:%#v", err, resp)
+			}
+			if resp.Data["plaintext"] != plaintext {
+				t.Fatalf("bad: plaintext. Expected: %q, Actual: %q", plaintext, resp.Data["plaintext"])
+			}
+		})
+	}
+}
+
+func TestTransit_EncryptKyber_NonceRejected(t *testing.T) {
+	variants := []string{"kyber512", "kyber768", "kyber1024"}
+
+	for _, keyType := range variants {
+		t.Run(keyType, func(t *testing.T) {
+			b, s := createBackendWithStorage(t)
+
+			createReq := &logical.Request{
+				Operation: logical.UpdateOperation,
+				Path:      "keys/kyber_nonce_" + keyType,
+				Storage:   s,
+				Data: map[string]interface{}{
+					"type": keyType,
+				},
+			}
+			if resp, err := b.HandleRequest(context.Background(), createReq); err != nil || (resp != nil && resp.IsError()) {
+				t.Fatalf("err:%v resp:%#v", err, resp)
+			}
+
+			nbData := map[string]interface{}{
+				"plaintext": "bXkgc2VjcmV0IGRhdGE=",
+				"nonce":     "R80hr9eNUIuFV52e",
+			}
+			nbReq := &logical.Request{
+				Operation: logical.CreateOperation,
+				Path:      "encrypt/kyber_nonce_" + keyType,
+				Storage:   s,
+				Data:      nbData,
+			}
+			if _, err := b.HandleRequest(context.Background(), nbReq); err == nil {
+				t.Fatal("expected invalid request")
+			}
+
+			batchReq := &logical.Request{
+				Operation: logical.CreateOperation,
+				Path:      "encrypt/kyber_nonce_" + keyType,
+				Storage:   s,
+				Data: map[string]interface{}{
+					"batch_input": []interface{}{nbData},
+				},
+			}
+			resp, err := b.HandleRequest(context.Background(), batchReq)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v, ok := resp.Data["http_status_code"]; !ok || v.(int) != http.StatusBadRequest {
+				t.Fatal("expected request error")
+			}
+		})
+	}
+}
+
+func TestTransit_EncryptKyber_InvalidBase64Plaintext(t *testing.T) {
+	variants := []string{"kyber512", "kyber768", "kyber1024"}
+
+	for _, keyType := range variants {
+		t.Run(keyType, func(t *testing.T) {
+			b, s := createBackendWithStorage(t)
+
+			createReq := &logical.Request{
+				Operation: logical.UpdateOperation,
+				Path:      "keys/kyber_badb64_" + keyType,
+				Storage:   s,
+				Data: map[string]interface{}{
+					"type": keyType,
+				},
+			}
+			if resp, err := b.HandleRequest(context.Background(), createReq); err != nil || (resp != nil && resp.IsError()) {
+				t.Fatalf("err:%v resp:%#v", err, resp)
+			}
+
+			bad := map[string]interface{}{"plaintext": "!!not-base64!!"}
+			nbReq := &logical.Request{
+				Operation: logical.CreateOperation,
+				Path:      "encrypt/kyber_badb64_" + keyType,
+				Storage:   s,
+				Data:      bad,
+			}
+			if _, err := b.HandleRequest(context.Background(), nbReq); err == nil {
+				t.Fatal("expected invalid request")
+			}
+
+			batchReq := &logical.Request{
+				Operation: logical.CreateOperation,
+				Path:      "encrypt/kyber_badb64_" + keyType,
+				Storage:   s,
+				Data:      map[string]interface{}{"batch_input": []interface{}{bad}},
+			}
+			resp, err := b.HandleRequest(context.Background(), batchReq)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v, ok := resp.Data["http_status_code"]; !ok || v.(int) != http.StatusBadRequest {
+				t.Fatal("expected request error")
+			}
+		})
+	}
+}
+
+func TestTransit_EncryptKyber_InvalidBase64Context(t *testing.T) {
+	variants := []string{"kyber512", "kyber768", "kyber1024"}
+
+	for _, keyType := range variants {
+		t.Run(keyType, func(t *testing.T) {
+			b, s := createBackendWithStorage(t)
+
+			createReq := &logical.Request{
+				Operation: logical.UpdateOperation,
+				Path:      "keys/kyber_badctx_" + keyType,
+				Storage:   s,
+				Data: map[string]interface{}{
+					"type": keyType,
+				},
+			}
+			if resp, err := b.HandleRequest(context.Background(), createReq); err != nil || (resp != nil && resp.IsError()) {
+				t.Fatalf("err:%v resp:%#v", err, resp)
+			}
+
+			bad := map[string]interface{}{
+				"plaintext": base64.StdEncoding.EncodeToString([]byte("hi")),
+				"context":   "!!not-base64!!",
+			}
+			nbReq := &logical.Request{
+				Operation: logical.CreateOperation,
+				Path:      "encrypt/kyber_badctx_" + keyType,
+				Storage:   s,
+				Data:      bad,
+			}
+			if _, err := b.HandleRequest(context.Background(), nbReq); err == nil {
+				t.Fatal("expected invalid request")
+			}
+
+			batchReq := &logical.Request{
+				Operation: logical.CreateOperation,
+				Path:      "encrypt/kyber_badctx_" + keyType,
+				Storage:   s,
+				Data:      map[string]interface{}{"batch_input": []interface{}{bad}},
+			}
+			resp, err := b.HandleRequest(context.Background(), batchReq)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v, ok := resp.Data["http_status_code"]; !ok || v.(int) != http.StatusBadRequest {
+				t.Fatal("expected request error")
+			}
+		})
+	}
+}
+
+func TestTransit_EncryptKyber_InvalidKeyVersion(t *testing.T) {
+	variants := []string{"kyber512", "kyber768", "kyber1024"}
+
+	for _, keyType := range variants {
+		t.Run(keyType, func(t *testing.T) {
+			b, s := createBackendWithStorage(t)
+
+			createReq := &logical.Request{
+				Operation: logical.UpdateOperation,
+				Path:      "keys/kyber_badver_" + keyType,
+				Storage:   s,
+				Data: map[string]interface{}{
+					"type": keyType,
+				},
+			}
+			if resp, err := b.HandleRequest(context.Background(), createReq); err != nil || (resp != nil && resp.IsError()) {
+				t.Fatalf("err:%v resp:%#v", err, resp)
+			}
+
+			data := map[string]interface{}{
+				"plaintext":   base64.StdEncoding.EncodeToString([]byte("hi")),
+				"key_version": 2, // latest is 1
+			}
+			nbReq := &logical.Request{
+				Operation: logical.CreateOperation,
+				Path:      "encrypt/kyber_badver_" + keyType,
+				Storage:   s,
+				Data:      data,
+			}
+			if _, err := b.HandleRequest(context.Background(), nbReq); err == nil {
+				t.Fatal("expected invalid request")
+			}
+
+			batchReq := &logical.Request{
+				Operation: logical.CreateOperation,
+				Path:      "encrypt/kyber_badver_" + keyType,
+				Storage:   s,
+				Data:      map[string]interface{}{"batch_input": []interface{}{data}},
+			}
+			resp, err := b.HandleRequest(context.Background(), batchReq)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v, ok := resp.Data["http_status_code"]; !ok || v.(int) != http.StatusBadRequest {
+				t.Fatal("expected request error")
+			}
+		})
+	}
+}
+
+func TestTransit_EncryptKyber_MinEncryptionBlocksOldVersion(t *testing.T) {
+	variants := []string{"kyber512", "kyber768", "kyber1024"}
+
+	for _, keyType := range variants {
+		t.Run(keyType, func(t *testing.T) {
+			b, s := createBackendWithStorage(t)
+
+			// Create; latest_version=1
+			createReq := &logical.Request{
+				Operation: logical.UpdateOperation,
+				Path:      "keys/kyber_minblock_" + keyType,
+				Storage:   s,
+				Data: map[string]interface{}{
+					"type": keyType,
+				},
+			}
+			if resp, err := b.HandleRequest(context.Background(), createReq); err != nil || (resp != nil && resp.IsError()) {
+				t.Fatalf("err:%v resp:%#v", err, resp)
+			}
+
+			// Rotate -> latest_version=2
+			rotateReq := &logical.Request{
+				Operation: logical.UpdateOperation,
+				Path:      "keys/kyber_minblock_" + keyType + "/rotate",
+				Storage:   s,
+				Data:      map[string]interface{}{},
+			}
+			if resp, err := b.HandleRequest(context.Background(), rotateReq); err != nil || (resp != nil && resp.IsError()) {
+				t.Fatalf("rotate err:%v resp:%#v", err, resp)
+			}
+
+			// Enforce min_encryption_version=2
+			cfgReq := &logical.Request{
+				Operation: logical.UpdateOperation,
+				Path:      "keys/kyber_minblock_" + keyType + "/config",
+				Storage:   s,
+				Data:      map[string]interface{}{"min_encryption_version": 2},
+			}
+			if resp, err := b.HandleRequest(context.Background(), cfgReq); err != nil || (resp != nil && resp.IsError()) {
+				t.Fatalf("config err:%v resp:%#v", err, resp)
+			}
+
+			// Non-batch: explicit key_version=1 must fail
+			nbReq := &logical.Request{
+				Operation: logical.CreateOperation,
+				Path:      "encrypt/kyber_minblock_" + keyType,
+				Storage:   s,
+				Data: map[string]interface{}{
+					"plaintext":   base64.StdEncoding.EncodeToString([]byte("hi")),
+					"key_version": 1,
+				},
+			}
+			if _, err := b.HandleRequest(context.Background(), nbReq); err == nil {
+				t.Fatal("expected invalid request")
+			}
+
+			// Batch: same failure -> http 400
+			batchReq := &logical.Request{
+				Operation: logical.CreateOperation,
+				Path:      "encrypt/kyber_minblock_" + keyType,
+				Storage:   s,
+				Data: map[string]interface{}{
+					"batch_input": []interface{}{
+						map[string]interface{}{
+							"plaintext":   base64.StdEncoding.EncodeToString([]byte("hi")),
+							"key_version": 1,
+						},
+					},
+				},
+			}
+			resp, err := b.HandleRequest(context.Background(), batchReq)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v, ok := resp.Data["http_status_code"]; !ok || v.(int) != http.StatusBadRequest {
+				t.Fatal("expected request error")
+			}
+		})
+	}
+}
+
+func TestTransit_BatchEncryptionKyber(t *testing.T) {
+	variants := []string{"kyber512", "kyber768", "kyber1024"}
+
+	for _, keyType := range variants {
+		t.Run(keyType, func(t *testing.T) {
+			backend, s := createBackendWithStorage(t)
+
+			createReq := &logical.Request{
+				Operation: logical.UpdateOperation,
+				Path:      "keys/kyber_batch_" + keyType,
+				Storage:   s,
+				Data: map[string]interface{}{
+					"type": keyType,
+				},
+			}
+			resp, err := backend.HandleRequest(context.Background(), createReq)
+			if err != nil || (resp != nil && resp.IsError()) {
+				t.Fatalf("err:%v resp:%#v", err, resp)
+			}
+
+			const batchSize = 3
+			batchInput := make([]interface{}, 0, batchSize)
+			for i := 0; i < batchSize; i++ {
+				batchInput = append(batchInput, map[string]interface{}{"plaintext": "dGhlIHF1aWNrIGJyb3duIGZveA=="})
+			}
+
+			batchReq := &logical.Request{
+				Operation: logical.CreateOperation,
+				Path:      "encrypt/kyber_batch_" + keyType,
+				Storage:   s,
+				Data:      map[string]interface{}{"batch_input": batchInput},
+			}
+			resp, err = backend.HandleRequest(context.Background(), batchReq)
+			if err != nil || (resp != nil && resp.IsError()) {
+				t.Fatalf("err:%v resp:%#v", err, resp)
+			}
+
+			brRaw := resp.Data["batch_results"]
+			if brRaw == nil {
+				t.Fatalf("unexpected batch_results: %#v", resp)
+			}
+			switch br := brRaw.(type) {
+			case []interface{}:
+				if len(br) != batchSize {
+					t.Fatalf("unexpected batch_results: %#v", resp)
+				}
+			case []EncryptBatchResponseItem:
+				if len(br) != batchSize {
+					t.Fatalf("unexpected batch_results: %#v", resp)
+				}
+			default:
+				t.Fatalf("unexpected batch_results type %T: %#v", brRaw, resp)
+			}
+		})
 	}
 }
