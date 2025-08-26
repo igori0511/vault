@@ -1956,10 +1956,6 @@ func (p *Policy) RotateInMemory(randReader io.Reader) (retErr error) {
 		//   • Never reuse a seed across different keys.
 		pk, sk := kyber.s.DeriveKeyPair(seed)
 
-		// (Optional, defense-in-depth) Reduce secret lifetime in memory.
-		// If you have a zeroize/wipe helper, consider clearing the seed now:
-		// for i := range seed { seed[i] = 0 }
-
 		// Serialize keys to binary for storage/transport.
 		// Private key bytes are stored sealed at rest by Vault and are never exposed
 		// via read endpoints; public key bytes are safe to return to clients.
@@ -2484,7 +2480,7 @@ func (p *Policy) EncryptWithFactory(ver int, context []byte, nonce []byte, value
 		// On success we get:
 		//   capsule  – Kyber ciphertext (fixed size per scheme), public artifact
 		//   nonce    – random AEAD nonce (size = aead.NonceSize())
-		//   ct       – AEAD ciphertext (len >= plaintext + tag)
+		//   ct       – AEAD ciphertext
 		capsule, nonce, ct, err := kyber.Encrypt(pk, plaintext, ad)
 		if err != nil {
 			return "", errutil.InternalError{Err: fmt.Sprintf("Kyber encryption failed: %v", err)}
